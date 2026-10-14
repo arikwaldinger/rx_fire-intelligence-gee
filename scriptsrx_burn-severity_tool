@@ -1,0 +1,724 @@
+// ==============================================================================
+// TITLE: Wisconsin Prescribed Fire Burn Severity & Recovery Tool
+// AUTHOR: Arik Waldinger
+// PURPOSE: Leverages Random Forest machine learning to automate burn perimeter extraction
+// and quantify severity (dNBR) across complex Wisconsin spring phenologies. This tool
+// employs adaptive "Minimum NBR" reducers and year-over-year phenology matching to
+
+// DATA SOURCE: Sentinel-2 MSI / Field Verified
+// METHODOLOGY NOTE: 
+// All 128 training polygons used in this Random Forest model were 
+// hand-digitized based on first-hand participation in these specific 
+// burn operations. This provides a high-fidelity "Ground Truth" 
+// baseline that traditional automated classifiers often lack.
+// *ACKNOWLEDGMENT: 
+// Parts of this codebase were developed with the assistance of Claude (Anthropic AI). 
+// AI was utilized for code optimization, debugging, and structural organization, 
+// while all ecological logic, field-validation data, and final architectural 
+// decisions were directed by the primary author.
+// ==============================================================================
+
+// ==============================================================================
+// ── SECTION 1: BURN UNIT CONFIGURATION & PHENOLOGY WINDOWS ────────────────────
+// ==============================================================================
+var unit_summary = [
+  {name:'avoca',            geom:avoca,            burnDate:'2025-03-10', cover:'wetland/woodland'},
+  {name:'cruson_slough',    geom:cruson_slough,     burnDate:'2025-03-13', cover:'wetland/woodland'},
+  {name:'arena',            geom:arena,             burnDate:'2025-03-18', cover:'woodland/wetland'},
+  {name:'westport',         geom:westport,          burnDate:'2025-03-25', cover:'grassland/savanna'},
+  {name:'mazomanie',        geom:mazomanie,         burnDate:'2025-03-27', cover:'barrens/savanna'},
+  {name:'marbleseed',       geom:marbleseed,        burnDate:'2025-04-01', cover:'grassland'},
+  {name:'blue_river',       geom:blue_river,        burnDate:'2025-04-04', cover:'barrens'},
+  {name:'devils_lake',      geom:devils_lake,       burnDate:'2025-04-08', cover:'woodland'},
+  {name:'dells_wi',         geom:dells_wi,          burnDate:'2025-04-12', cover:'woodland'},
+  {name:'hardscrabble',     geom:hardscrabble,      burnDate:'2025-04-16', cover:'woodland/savanna'},
+  {name:'yellowstone',      geom:yellowstone,       burnDate:'2025-04-25', cover:'woodland/grassland/savanna'},
+  {name:'yorks',            geom:yorks,             burnDate:'2025-04-26', cover:'grassland'},
+  {name:'bakkens',          geom:bakkens,           burnDate:'2025-04-27', cover:'savanna/grassland'},
+  {name:'belmont',          geom:belmont,           burnDate:'2025-04-30', cover:'grassland'},
+  {name:'lower_narrows',    geom:lower_narrows,     burnDate:'2025-05-01', cover:'woodland'},
+  {name:'natural_bridge',   geom:natural_bridge,    burnDate:'2025-05-09', cover:'woodland/grassland'},
+];
+
+// 1. Define column widths for alignment
+var col1 = 18; // Width for Unit Name
+var col2 = 15; // Width for Burn Date
+
+// 2. Helper function to pad spaces so text aligns perfectly
+function padRight(text, width) {
+  text = text || '';
+  return text + Array(Math.max(0, width - text.length + 1)).join(' ');
+}
+
+// 3. Create the table header and separator line
+var header = padRight('UNIT NAME', col1) + padRight('BURN DATE', col2) + 'COVER TYPE';
+var separator = '------------------------------------------------------------------';
+
+// 4. Start the table array with the header
+var tableRows = [header, separator];
+
+// 5. Loop through each unit and format the row
+unit_summary.forEach(function(unit) {
+  var row = padRight(unit.name, col1) + 
+            padRight(unit.burnDate, col2) + 
+            unit.cover;
+  tableRows.push(row);
+});
+
+// 6. Join the rows with line breaks and print to the console
+print('--- BURN UNIT SUMMARY TABLE ---');
+print(tableRows.join('\n'));
+
+// TUTORIAL NOTE: Because Wisconsin ecosystems green up at different 
+// rates, we cannot use one universal date range. We must hardcode specific 
+// pre-fire and post-fire windows based on local phenology and burn dates.
+
+var unitInfo = [
+  // ── EARLY SEASON / WETLANDS / GRASSLANDS (Standard 2025 Baseline) ──
+  {name:'avoca',          geom:avoca,
+   preStart:'2025-01-01', preEnd:'2025-03-08',
+   postStart:'2025-03-17', postEnd:'2025-04-14',   
+   cover:'wetland/woodland'},
+  {name:'cruson_slough',  geom:cruson_slough,
+   preStart:'2025-01-01', preEnd:'2025-03-11',
+   postStart:'2025-03-20', postEnd:'2025-05-08',  
+   cover:'wetland/woodland'},
+  {name:'arena',          geom:arena,
+   preStart:'2025-01-01', preEnd:'2025-03-16',
+   postStart:'2025-03-25', postEnd:'2025-04-22',
+   cover:'woodland/wetland'},
+  {name:'mazomanie',      geom:mazomanie,
+   preStart:'2025-01-01', preEnd:'2025-03-25',
+   postStart:'2025-04-03', postEnd:'2025-05-01',
+   cover:'barrens/savanna'},
+  {name:'marbleseed',     geom:marbleseed,
+   preStart:'2025-01-01', preEnd:'2025-03-30',
+   postStart:'2025-04-08', postEnd:'2025-04-29',   
+   cover:'grassland'},
+  {name:'blue_river',     geom:blue_river,
+   preStart:'2025-01-01', preEnd:'2025-04-02',
+   postStart:'2025-04-09', postEnd:'2025-04-30',   
+   cover:'barrens'},
+  {name:'yorks',          geom:yorks,
+   preStart:'2025-01-01', preEnd:'2025-04-24',
+   postStart:'2025-04-29', postEnd:'2025-05-09',   
+   cover:'grassland'},
+  {name:'bakkens',        geom:bakkens,
+   preStart:'2025-01-01', preEnd:'2025-04-26',   
+   postStart:'2025-04-28', postEnd:'2025-05-15', 
+   cover:'savanna/grassland'},
+  {name:'belmont',        geom:belmont,
+   preStart:'2025-01-01', preEnd:'2025-04-29',   
+   postStart:'2025-05-01', postEnd:'2025-05-15', 
+   cover:'grassland'},
+
+  // ── LATE SEASON WOODLANDS (Year-Over-Year 2024 Baseline) ──
+  // TUTORIAL NOTE: Because these burned late, the May 2025 canopy hides the burn. 
+  //We use May 2024 as the baseline to compare "Leaf-on" to "Leaf-on".
+  {name:'dells_wi',       geom:dells_wi,
+   preStart:'2024-05-10', preEnd:'2024-05-31', 
+   postStart:'2025-05-10', postEnd:'2025-05-31',   
+   cover:'woodland'},
+  {name:'hardscrabble',   geom:hardscrabble,
+   preStart:'2024-04-20', preEnd:'2024-05-21',   
+   postStart:'2025-04-23', postEnd:'2025-05-21', 
+   cover:'woodland/savanna'},
+  {name:'yellowstone',    geom:yellowstone,
+   preStart:'2024-05-10', preEnd:'2024-05-31', 
+   postStart:'2025-05-10', postEnd:'2025-05-31',   
+   cover:'woodland/grassland/savanna'},
+  {name:'lower_narrows',  geom:lower_narrows,
+   preStart:'2024-05-11', preEnd:'2024-05-14', 
+   postStart:'2025-05-11', postEnd:'2025-05-14',   
+   cover:'woodland'},
+  {name:'natural_bridge', geom:natural_bridge,
+   preStart:'2024-05-11', preEnd:'2024-05-14', 
+   postStart:'2025-05-11', postEnd:'2025-05-14',   
+   cover:'woodland/grassland'},
+  {name:'devils_lake',    geom:devils_lake, 
+   preStart:'2024-05-01', preEnd:'2024-05-31',   
+   postStart:'2025-05-01', postEnd:'2025-05-31', 
+   cover:'woodland'}
+];
+
+// Convert dictionary into an Earth Engine Feature Collection for mapping
+var units = ee.FeatureCollection(unitInfo.map(function(u) {
+  return ee.Feature(u.geom, {name:u.name, cover:u.cover});
+}));
+var aoi = units.geometry().dissolve(1);
+
+
+// ==============================================================================
+// ── SECTION 2: SATELLITE DATA PIPELINE (SENTINEL-2) ───────────────────────────
+// ==============================================================================
+
+// Function to mask out clouds and cloud shadows using the SCL band
+function maskS2clouds(image) {
+  var scl = image.select('SCL');
+  var mask = scl.eq(3).or(scl.eq(8)).or(scl.eq(9))
+                .or(scl.eq(10)).or(scl.eq(1)).or(scl.eq(11)).not();
+  return image.updateMask(mask).divide(10000)
+              .copyProperties(image, ['system:time_start']);
+}
+
+// Fetch Sentinel-2 Harmonized Surface Reflectance imagery over our Area of Interest
+var s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+  .filterBounds(aoi)
+  .filterDate('2024-05-01','2025-06-30')
+  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 70))
+  .map(maskS2clouds);
+
+
+// ==============================================================================
+// ── SECTION 3: FEATURE ENGINEERING (THE 33-BAND STACK) ────────────────────────
+// ==============================================================================
+
+// Specialized Burn Indices 
+function addIndices(image) {
+  var nbr   = image.normalizedDifference(['B8','B12']).rename('NBR');
+  var nbr2  = image.normalizedDifference(['B8A','B11']).rename('NBR2');
+  var ndvi  = image.normalizedDifference(['B8','B4']).rename('NDVI');
+  var evi   = image.expression('2.5*((NIR-RED)/(NIR+6*RED-7.5*BLUE+1))',
+    {NIR:image.select('B8'),RED:image.select('B4'),BLUE:image.select('B2')}).rename('EVI');
+  var bai   = image.expression('1.0/((0.1-RED)**2+(0.06-NIR)**2)',
+    {RED:image.select('B4'),NIR:image.select('B8')}).rename('BAI');
+  var bsi   = image.expression('((SWIR1+RED)-(NIR+BLUE))/((SWIR1+RED)+(NIR+BLUE))',
+    {SWIR1:image.select('B11'),RED:image.select('B4'),
+     NIR:image.select('B8'),BLUE:image.select('B2')}).rename('BSI');
+  var mndwi = image.normalizedDifference(['B3','B11']).rename('MNDWI');
+  var cri   = image.select('B12').divide(image.select('B8').add(0.001)).rename('CRI');
+  var nbrNdvi = nbr.subtract(ndvi).rename('NBR_NDVI');
+  var mirbi = image.expression('10*SWIR2-9.8*SWIR1+2',
+    {SWIR2:image.select('B12'),SWIR1:image.select('B11')}).rename('MIRBI');
+  var bais2 = image.expression(
+    '(1-sqrt((RE2*RE3*RE4)/RED))*((SWIR2-RE4)/sqrt(SWIR2+RE4)+1)',
+    {RE2:image.select('B6'),RE3:image.select('B7'),RE4:image.select('B8A'),
+     RED:image.select('B4'),SWIR2:image.select('B12')}).rename('BAIS2');
+  var ndre  = image.normalizedDifference(['B8','B5']).rename('NDRE');
+  var csi   = image.select('B8').divide(image.select('B11').add(0.001)).rename('CSI');
+  var swirR = image.select('B12').divide(image.select('B11').add(0.001)).rename('SWIR_ratio');
+  return image.addBands([nbr,nbr2,ndvi,evi,bai,bsi,mndwi,cri,
+                         nbrNdvi,mirbi,bais2,ndre,csi,swirR]);
+}
+
+var s2idx = s2.map(addIndices);
+
+// Create seasonal composites to feed the classifier
+var preComp  = s2idx.filterDate('2025-01-01','2025-03-08').median().clip(aoi);
+var midComp  = s2idx.filterDate('2025-04-15','2025-05-10').median().clip(aoi);
+var postComp = s2idx.filterDate('2025-05-15','2025-06-30').median().clip(aoi);
+
+// Calculate delta (change) indices representing the before & after difference
+var dNBRch  = preComp.select('NBR').subtract(postComp.select('NBR')).rename('dNBR');
+var dBSIch  = postComp.select('BSI').subtract(preComp.select('BSI')).rename('dBSI');
+var dBAIch  = postComp.select('BAI').subtract(preComp.select('BAI')).rename('dBAI');
+var dNDVIch = postComp.select('NDVI').subtract(preComp.select('NDVI')).rename('dNDVI');
+var dNDREch = preComp.select('NDRE').subtract(postComp.select('NDRE')).rename('dNDRE');
+var dMIRBI  = postComp.select('MIRBI').subtract(preComp.select('MIRBI')).rename('dMIRBI');
+var dBAIS2  = postComp.select('BAIS2').subtract(preComp.select('BAIS2')).rename('dBAIS2');
+
+// Build the final 33-Band Stack
+var featureStack = postComp
+  .select(['NBR','NBR2','NDVI','EVI','BAI','BSI','MNDWI','CRI'])
+  .addBands(preComp.select(['NBR','NDVI','BSI','BAI']).rename(['preNBR','preNDVI','preBSI','preBAI']))
+  .addBands([dNBRch,dBSIch,dBAIch,dNDVIch])
+  .addBands(postComp.select(['BAIS2','MIRBI','NDRE','CSI','SWIR_ratio','NBR_NDVI']))
+  .addBands(preComp.select(['NDRE','CSI']).rename(['preNDRE','preCSI']))
+  .addBands([dNDREch,dMIRBI,dBAIS2])
+  .addBands(midComp.select(['NBR','NDVI','BSI','BAI','BAIS2','NDRE'])
+    .rename(['midNBR','midNDVI','midBSI','midBAI','midBAIS2','midNDRE']))
+  .clip(aoi);
+
+var inputFeatures = [
+  'NBR','NBR2','NDVI','EVI','BAI','BSI','MNDWI','CRI',
+  'preNBR','preNDVI','preBSI','preBAI',
+  'dNBR','dBSI','dBAI','dNDVI',
+  'BAIS2','MIRBI','NDRE','CSI','SWIR_ratio','NBR_NDVI',
+  'preNDRE','preCSI','dNDRE','dMIRBI','dBAIS2',
+  'midNBR','midNDVI','midBSI','midBAI','midBAIS2','midNDRE'
+];
+
+// --- SECTION: MODEL TRANSPARENCY GLOSSARY ---
+// Define a dictionary of abbreviations used in the 33-band stack
+var bandGlossary = {
+  'B2, B3, B4, B8': 'Raw spectral bands (Blue, Green, Red, Near-Infrared)',
+  'B11, B12': 'Shortwave Infrared (SWIR) - High sensitivity to ash and soil moisture',
+  'NBR': 'Normalized Burn Ratio - The industry standard for fire severity',
+  'MIRBI': 'Mid-Infrared Burn Index - Excellent for detecting charred woody debris',
+  'BAIS2': 'Burn Area Index for Sentinel-2 - Specifically tuned for ash/charcoal detection',
+  'NDVI': 'Normalized Difference Vegetation Index - Measures "greenness" and recovery',
+  'dNBR': 'Delta NBR - The absolute change in vegetation/ash between pre- and post-fire',
+  'Pre/Post Prefix': 'Indicates if the band represents the unburned baseline or the post-fire state'
+};
+
+print('--- 1. FEATURE STACK GLOSSARY ---', bandGlossary);
+print('Note: The 33-band stack includes "Pre", "Post", and "Delta" versions of these features.');
+
+// ==============================================================================
+// ── SECTION 4: MACHINE LEARNING (RANDOM FOREST CLASSIFIER) ────────────────────
+// ==============================================================================
+
+// Load ground-truthed training polygons
+var training = ee.FeatureCollection('projects/code-test-476615/assets/Burn_TrainingData');
+
+// ---Display 128 Training Data Polygons---
+// 1. Center the map on your training data so the camera jumps right to it
+Map.centerObject(training, 11);
+
+// 2. Filter the polygons by their class_id
+// (Note: adjust the '1' and '0' if your class IDs are numbered differently)
+var burnedTraining = training.filter(ee.Filter.eq('class_id', 1));
+var unburnedTraining = training.filter(ee.Filter.eq('class_id', 0)); 
+
+// 3. Map Training Polygons
+// 'red' for burned fire scars and 'green' for unburned forest/grass
+Map.addLayer(burnedTraining, {color: 'red'}, 'Burned Training Polygons');
+Map.addLayer(unburnedTraining, {color: 'green'}, 'Unburned Training Polygons');
+
+// Extract pixel values from the 33-band stack that fall inside our training polygons
+var trainingSamples = featureStack.sampleRegions({
+  collection: training,
+  properties: ['class_id'],
+  scale: 20, tileScale: 4, geometries: false
+});
+
+// 1. Add a random column to your samples to split them 80/20
+var sampleWithRandom = trainingSamples.randomColumn('random');
+var trainData = sampleWithRandom.filter(ee.Filter.lt('random', 0.8));
+var testData = sampleWithRandom.filter(ee.Filter.gte('random', 0.8));
+
+// 2. Train the Random Forest Model on the 80% TRAINING data
+var rf = ee.Classifier.smileRandomForest({
+  numberOfTrees:200, variablesPerSplit:4, minLeafPopulation:5, seed:42
+}).train({
+  features: trainData,
+  classProperty: 'class_id',
+  inputProperties: inputFeatures
+});
+
+// 3. Classify the 20% TEST data to evaluate unbiased performance
+var testClassified = testData.classify(rf);
+
+// 4. Generate the Error Matrix (Confusion Matrix)
+// 'class_id' is the ground truth, 'classification' is the model's prediction
+var errorMatrix = testClassified.errorMatrix('class_id', 'classification');
+
+// 5. Calculate Standard Metrics
+var overallAccuracy = errorMatrix.accuracy();
+var kappa = errorMatrix.kappa();
+
+// 6. Calculate Jaccard Index (Intersection over Union) for the "Burned" Class
+// Assuming Class 1 is "Burned" in a 3-class system (0: Unburned, 1: Burned, 2: Other)
+// True Positives (Burned predicted as Burned) = array index [1, 1]
+var tp = ee.Number(errorMatrix.array().get([1, 1]));
+
+// False Positives (Unburned or Other predicted as Burned) = array indices [0, 1] + [2, 1]
+var fp = ee.Number(errorMatrix.array().get([0, 1]))
+           .add(ee.Number(errorMatrix.array().get([2, 1])));
+
+// False Negatives (Burned predicted as Unburned or Other) = array indices [1, 0] + [1, 2]
+var fn = ee.Number(errorMatrix.array().get([1, 0]))
+           .add(ee.Number(errorMatrix.array().get([1, 2])));
+
+// Jaccard Formula: TP / (TP + FP + FN)
+var jaccard = tp.divide(tp.add(fp).add(fn));
+
+// 7. Print accuracy metrics to the console
+print('══════════════════════════════════');
+print('🌲 RANDOM FOREST PERFORMANCE 🌲');
+print('══════════════════════════════════');
+print('Overall Accuracy:', overallAccuracy);
+print('Kappa Statistic:', kappa);
+print('Jaccard Index (Burned Class):', jaccard);
+print('Full Error Matrix:', errorMatrix);
+
+// Apply the trained model to the entire area to map the actual fire scars
+var burnMask = featureStack.classify(rf).eq(1).clip(aoi);
+print('Burn mask successfully generated');
+
+
+// ==============================================================================
+// ── SECTION 5: ADAPTIVE BURN SEVERITY (dNBR) EXTRACTION & SUMMARY ─────────────
+// ==============================================================================
+
+// Set Standard USGS Severity thresholds
+function classifySeverity(dNBRimage) {
+  return dNBRimage
+    .where(dNBRimage.lt(0.05),                                0) // Unburned/Regrowth
+    .where(dNBRimage.gte(0.05).and(dNBRimage.lt(0.20)),       1) // Low
+    .where(dNBRimage.gte(0.20).and(dNBRimage.lt(0.35)),       2) // Moderate-Low
+    .where(dNBRimage.gte(0.35).and(dNBRimage.lt(0.55)),       3) // Moderate-High
+    .where(dNBRimage.gte(0.55),                               4) // High
+    .rename('severity');
+}
+
+print('────────────────────────────────────────');
+print('PER-UNIT SEVERITY — ADAPTIVE METHODOLOGY');
+print('────────────────────────────────────────');
+
+var severityImages = [];
+
+// --- GRAND SUMMARY TRACKERS ---
+// We use these variables to accumulate the totals across all units
+var seasonSummary = {
+  totalRF_ac: 0,
+  totalClass_ac: 0,
+  totalLow: 0,
+  totalModLow: 0,
+  totalModHigh: 0,
+  totalHigh: 0,
+  weighted_dNBR_sum: 0,
+  total_n: 0,
+  unitsProcessed: 0
+};
+var totalUnits = unitInfo.length;
+
+unitInfo.forEach(function(u) {
+  
+  // 1. PRE-FIRE BASELINE (Median)
+  var preNBR = s2.filterDate(u.preStart, u.preEnd)
+    .median()
+    .normalizedDifference(['B8','B12']);
+
+  // 2. POST-FIRE ASH EXTRACTION (Minimum)
+  var postNBR = s2.filterDate(u.postStart, u.postEnd)
+    .map(function(img) {
+      return img.normalizedDifference(['B8','B12']);
+    })
+    .min(); 
+
+  var dNBR = preNBR.subtract(postNBR);
+  var sev  = classifySeverity(dNBR).updateMask(burnMask.clip(u.geom));
+
+  severityImages.push(sev.clip(u.geom));
+
+  var dNBRstats = dNBR.updateMask(burnMask.clip(u.geom)).reduceRegion({
+    reducer: ee.Reducer.mean()
+      .combine(ee.Reducer.percentile([25,50,75]),'',true)
+      .combine(ee.Reducer.count(),'',true),
+    geometry: u.geom, scale:20, maxPixels:1e9, bestEffort:true
+  });
+
+  var calcAcres = function(cls) {
+    return ee.Number(
+      sev.eq(cls).multiply(ee.Image.pixelArea())
+        .reduceRegion({reducer:ee.Reducer.sum(),
+          geometry:u.geom, scale:20, maxPixels:1e9, bestEffort:true})
+        .values().get(0)
+    ).divide(4046.856);
+  };
+
+  var rfAcres = ee.Number(
+    burnMask.clip(u.geom).multiply(ee.Image.pixelArea())
+      .reduceRegion({reducer:ee.Reducer.sum(),
+        geometry:u.geom, scale:20, maxPixels:1e9, bestEffort:true})
+      .values().get(0)
+  ).divide(4046.856);
+
+  ee.Dictionary({
+    low:calcAcres(1), modLow:calcAcres(2),
+    modHigh:calcAcres(3), high:calcAcres(4), rf:rfAcres
+  }).evaluate(function(a) {
+    dNBRstats.evaluate(function(s) {
+      
+      var sev_total = a.low + a.modLow + a.modHigh + a.high;
+      var pct_cov   = a.rf > 0 ? (sev_total/a.rf*100).toFixed(0) : '0';
+      
+      // Print Per-Unit Data
+      print('═══ ' + u.name + ' (' + u.cover + ') ═══');
+      print('  window: ' + u.postStart + ' → ' + u.postEnd);
+      print('  RF burned: ' + a.rf.toFixed(1) + ' ac' +
+            ' | dNBR classified: ' + sev_total.toFixed(1) + ' ac' +
+            ' | coverage: ' + pct_cov + '%');
+            
+      if (s && s.nd_mean !== null) {
+        print('  dNBR p25=' + (s.nd_p25||0).toFixed(3) +
+              ' p50=' + (s.nd_p50||0).toFixed(3) +
+              ' p75=' + (s.nd_p75||0).toFixed(3) +
+              ' mean=' + (s.nd_mean||0).toFixed(3) +
+              ' n=' + (s.nd_count||0));
+              
+        // Accumulate for Grand Summary (Weighting the mean by pixel count)
+        seasonSummary.weighted_dNBR_sum += (s.nd_mean * s.nd_count);
+        seasonSummary.total_n += s.nd_count;
+      }
+      
+      if (sev_total > 0.5) {
+        print('  Low:      ' + a.low.toFixed(1) + ' ac (' + (a.low/sev_total*100).toFixed(1) + '%)');
+        print('  Mod-low:  ' + a.modLow.toFixed(1) + ' ac (' + (a.modLow/sev_total*100).toFixed(1) + '%)');
+        print('  Mod-high: ' + a.modHigh.toFixed(1) + ' ac (' + (a.modHigh/sev_total*100).toFixed(1) + '%)');
+        print('  High:     ' + a.high.toFixed(1) + ' ac (' + (a.high/sev_total*100).toFixed(1) + '%)');
+        
+        // Accumulate acreage for Grand Summary
+        seasonSummary.totalRF_ac += a.rf;
+        seasonSummary.totalClass_ac += sev_total;
+        seasonSummary.totalLow += a.low;
+        seasonSummary.totalModLow += a.modLow;
+        seasonSummary.totalModHigh += a.modHigh;
+        seasonSummary.totalHigh += a.high;
+      } else {
+        print('  ⚠ Canopy obscuring signal or persistent cloud cover.');
+        seasonSummary.totalRF_ac += a.rf; // Still count the RF burned acreage
+      }
+      
+      // --- TRIGGER GRAND SUMMARY ---
+      // Check if this is the last unit to finish processing
+      seasonSummary.unitsProcessed++;
+      if (seasonSummary.unitsProcessed === totalUnits) {
+        var totalCov = seasonSummary.totalRF_ac > 0 ? 
+                       (seasonSummary.totalClass_ac / seasonSummary.totalRF_ac * 100).toFixed(0) : 0;
+        var seasonMeanNBR = seasonSummary.total_n > 0 ? 
+                            (seasonSummary.weighted_dNBR_sum / seasonSummary.total_n).toFixed(3) : 0;
+                            
+        var pctLow = (seasonSummary.totalLow / seasonSummary.totalClass_ac * 100).toFixed(1);
+        var pctModLow = (seasonSummary.totalModLow / seasonSummary.totalClass_ac * 100).toFixed(1);
+        var pctModHigh = (seasonSummary.totalModHigh / seasonSummary.totalClass_ac * 100).toFixed(1);
+        var pctHigh = (seasonSummary.totalHigh / seasonSummary.totalClass_ac * 100).toFixed(1);
+
+        print('════════════════════════════════════════════════');
+        print('🔥 ENTIRE SEASON BURN SUMMARY (All Units) 🔥');
+        print('════════════════════════════════════════════════');
+        print('Total RF Burned Area:   ' + seasonSummary.totalRF_ac.toFixed(1) + ' acres');
+        print('Total Classified Area:  ' + seasonSummary.totalClass_ac.toFixed(1) + ' acres (' + totalCov + '% overall coverage)');
+        print('Season Average dNBR:    ' + seasonMeanNBR + ' (n=' + seasonSummary.total_n + ' pixels)');
+        print(' ');
+        print('--- TOTAL SEVERITY BREAKDOWN ---');
+        print('Low:           ' + seasonSummary.totalLow.toFixed(1) + ' ac  (' + pctLow + '%)');
+        print('Moderate-Low:  ' + seasonSummary.totalModLow.toFixed(1) + ' ac  (' + pctModLow + '%)');
+        print('Moderate-High: ' + seasonSummary.totalModHigh.toFixed(1) + ' ac  (' + pctModHigh + '%)');
+        print('High:          ' + seasonSummary.totalHigh.toFixed(1) + ' ac  (' + pctHigh + '%)');
+        print('════════════════════════════════════════════════');
+      }
+    });
+  });
+});
+
+var severityMosaic = ee.ImageCollection(severityImages).mosaic();
+
+// ==============================================================================
+// ── SECTION 6: FIRE EFFECTIVENESS INDEX (FEI) ─────────────────────────────────
+// ==============================================================================
+// TUTORIAL NOTE: Translating raw severity into a management scorecard.
+
+print('────────────────────────────────────────');
+print('GENERATING FIRE EFFECTIVENESS INDEX (FEI)...');
+print('────────────────────────────────────────');
+
+// FEI Scorecard (+1 = Success, 0 = Mosaic, -1 = Overburn)
+var fei = severityMosaic.remap(
+  [0, 1, 2, 3, 4],
+  [0, 1, 1, 1, -1]
+).rename('FEI').updateMask(burnMask);
+
+print('FEI successfully generated.');
+
+// ==============================================================================
+// ── SECTION 7: VEGETATION RECOVERY & STRESS TRAJECTORY (NDVI) ─────────────────
+// ==============================================================================
+
+print('────────────────────────────────────────');
+print('GENERATING LONG-TERM RECOVERY CHART...');
+print('────────────────────────────────────────');
+
+// 1. Fetch a wider historical dataset (2022 to 2025) just for this analysis
+var s2_history = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+  .filterBounds(aoi)
+  .filterDate('2022-01-01', '2025-09-30')
+  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 60))
+  .map(maskS2clouds);
+
+// 2. Define the years we want to analyze
+var analysisYears = ee.List([2022, 2023, 2024, 2025]);
+
+// 3. Create a function to extract the Peak Summer (July-Aug) NDVI for each year
+var getSummerNDVI = function(year) {
+  var start = ee.Date.fromYMD(year, 7, 1);
+  var end   = ee.Date.fromYMD(year, 8, 31);
+  
+  var summerImg = s2_history
+    .filterDate(start, end)
+    .median() // Get the cloud-free median summer pixel
+    .normalizedDifference(['B8', 'B4']) // Calculate NDVI
+    .rename('NDVI')
+    .set('system:time_start', start.millis()) // Required for charting
+    .set('year', year);
+    
+  return summerImg;
+};
+
+// 4. Map the function over our years to create a Time-Series Image Collection
+var summerNdviCollection = ee.ImageCollection.fromImages(analysisYears.map(getSummerNDVI));
+
+// 5. Generate a beautiful Line Chart comparing the units
+var recoveryChart = ui.Chart.image.seriesByRegion({
+  imageCollection: summerNdviCollection,
+  regions: units, // Maps the trajectory for each individual unit!
+  reducer: ee.Reducer.mean(),
+  band: 'NDVI',
+  scale: 20,
+  xProperty: 'system:time_start',
+  seriesProperty: 'name'
+}).setOptions({
+  title: 'Peak Summer Greenness (NDVI): Pre-Fire Baseline vs. Post-Fire Recovery',
+  vAxis: {title: 'Average Summer NDVI (Vigor/Production)'},
+  hAxis: {title: 'Growing Season (July-Aug)', format: 'YYYY'},
+  lineWidth: 3,
+  pointSize: 6,
+  curveType: 'function', // smooths the lines slightly
+  height: '400px'
+});
+
+// 6. Print the chart to the console
+print(recoveryChart);
+
+
+// ──  SUMMER RECOVERY SUMMARY TABLE (NDVI PERCENT CHANGE) ────────────
+
+print('Calculating Peak Summer NDVI trajectories... (this may take a moment)');
+
+// 1. Get summer imagery (July & August) across historical and post-fire years
+var s2_summer = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+  .filterBounds(aoi)
+  .filter(ee.Filter.calendarRange(7, 8, 'month')) // Only July and August
+  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 60))
+  .map(maskS2clouds);
+
+// 2. Calculate Pre-Fire Baseline (Average of 2022, 2023, 2024)
+var preFireNDVI = s2_summer
+  .filter(ee.Filter.calendarRange(2022, 2024, 'year'))
+  .median()
+  .normalizedDifference(['B8', 'B4'])
+  .rename('preNDVI');
+
+// 3. Calculate Post-Fire Recovery (Summer 2025)
+var postFireNDVI = s2_summer
+  .filter(ee.Filter.calendarRange(2025, 2025, 'year'))
+  .median()
+  .normalizedDifference(['B8', 'B4'])
+  .rename('postNDVI');
+
+// 4. Combine them into one image so we can extract the data simultaneously
+var combinedNDVI = preFireNDVI.addBands(postFireNDVI);
+
+// 5. Extract the average values for each burn unit
+var unitRecoveryStats = combinedNDVI.reduceRegions({
+  collection: units,
+  reducer: ee.Reducer.mean(),
+  scale: 20,
+  tileScale: 4
+});
+
+// 6. Calculate the Percent Change inside Earth Engine
+var statsWithChange = unitRecoveryStats.map(function(f) {
+  var pre = ee.Number(f.get('preNDVI'));
+  var post = ee.Number(f.get('postNDVI'));
+  
+  // Percent Change Formula: ((Post - Pre) / Pre) * 100
+  var pctChange = post.subtract(pre).divide(pre).multiply(100);
+  
+  return f.set('pctChange', pctChange);
+});
+
+// 7. Format and print the table to the console
+statsWithChange.evaluate(function(featureCollection) {
+  var features = featureCollection.features;
+
+  // Helper function to keep columns aligned
+  function padRight(text, width) {
+    text = text !== null ? String(text) : '';
+    return text + Array(Math.max(0, width - text.length + 1)).join(' ');
+  }
+
+  var col1 = 18; // Unit Name
+  var col2 = 15; // Pre-fire
+  var col3 = 15; // Post-fire
+
+  var header = padRight('UNIT NAME', col1) + 
+               padRight('PRE (22-24)', col2) + 
+               padRight('POST (2025)', col3) + 
+               'CHANGE (%)';
+               
+  var separator = '--------------------------------------------------------------';
+  var tableRows = [header, separator];
+
+  features.forEach(function(f) {
+    var props = f.properties;
+    var name = props.name;
+    
+    // Format numbers to 3 decimal places for NDVI, 1 for Percentage
+    var pre = props.preNDVI ? props.preNDVI.toFixed(3) : 'N/A';
+    var post = props.postNDVI ? props.postNDVI.toFixed(3) : 'N/A';
+    var pct = props.pctChange ? props.pctChange.toFixed(1) + '%' : 'N/A';
+    
+    // Add a plus sign to positive changes so it reads cleanly
+    if (props.pctChange && props.pctChange > 0) { pct = '+' + pct; }
+
+    tableRows.push(
+      padRight(name, col1) + 
+      padRight(pre, col2) + 
+      padRight(post, col3) + 
+      pct
+    );
+  });
+
+  print('──────────────────────────────────────────────────────────────');
+  print('SUMMER RECOVERY SUMMARY (JULY-AUG PEAK NDVI)');
+  print('──────────────────────────────────────────────────────────────');
+  print(tableRows.join('\n'));
+});
+
+
+// ==============================================================================
+// ── SECTION 8: VISUALIZATION, MAPPING, & EXPORT ───────────────────────────────
+// ==============================================================================
+
+// Center the map camera on the training data/units
+Map.centerObject(training, 11);
+
+// Add layers in the exact order you will present them
+Map.addLayer(burnMask.selfMask(), 
+  {palette:['#FF6600']}, '1. RF Burn Mask', false);
+
+Map.addLayer(severityMosaic, 
+  {min:1, max:4, palette:['#a8d08d','#ffd966','#f4b942','#c00000']}, 
+  '2. Burn Severity (dNBR)', false);
+
+// *NEW* - Added the FEI layer so you can show it in the video!
+Map.addLayer(fei, 
+  {min: -1, max: 1, palette: ['#d73027', '#a8a8a8', '#1a9850']}, 
+  '3. Fire Effectiveness Index (FEI)', false);
+
+Map.addLayer(units.style({color:'white', fillColor:'00000000', width:1.5}), 
+  {}, '4. Burn Unit Bounding Box');
+
+// Export to Google Drive
+Export.image.toDrive({
+  image: severityMosaic.toFloat(),
+  description: 'WI_BurnSeverity_Final_2025',
+  folder: 'GEE_FireIntelligence',
+  region: aoi,
+  scale: 20,
+  crs: 'EPSG:32616',
+  maxPixels: 1e9
+});
+
+// --- SECTION: VARIABLE IMPORTANCE ---
+
+// --- SECTION: RANKED VARIABLE IMPORTANCE ---
+var dict = rf.explain();
+var importance = ee.Dictionary(dict).get('importance');
+
+// 1. Get the keys (band names)
+var keys = ee.Dictionary(importance).keys();
+
+// 2. Sort the keys based on the values in the importance dictionary
+// .sort() sorts ascending, so we use .reverse() to get most-to-least
+var sortedKeys = keys.sort(ee.Dictionary(importance).values()).reverse();
+
+// 3. Create a formatted list of strings for the console
+var rankedImportance = sortedKeys.map(function(key) {
+  var value = ee.Number(ee.Dictionary(importance).get(key)).format('%.2f');
+  return ee.String(key).cat(': ').cat(value);
+});
+
+print('--- 2. RANKED VARIABLE IMPORTANCE (Most to Least) ---', rankedImportance);
