@@ -1,57 +1,92 @@
-# Full-Cycle Fire Intelligence & Soil Risk Model in Google Earth Engine
+# Wisconsin Prescribed Fire Burn Severity & Recovery Tool
 
-![Fire Intelligence Banner](assets/fire_intelligence_header.png)
+![GEE Prescribed Fire Intelligence](https://img.shields.io/badge/Google_Earth_Engine-JavaScript-4285F4?style=for-the-badge&logo=googleearthengine&logoColor=white)
+![Platform](https://img.shields.io/badge/Sentinel--2-10m_Resolution-00A859?style=for-the-badge)
+![Machine Learning](https://img.shields.io/badge/Random_Forest-200_Trees-FF6600?style=for-the-badge)
 
 ## Overview
-This repository contains the complete Google Earth Engine (GEE) JavaScript pipeline developed for end-to-end prescribed burn and wildfire analysis across 2,700 acres. The model integrates multi-sensor satellite imagery (Sentinel-2 MSI, Landsat 8/9, Sentinel-1 SAR) and topographic terrain models to evaluate pre-fire fuel moisture, map post-fire burn severity (dNBR), model soil erosion hazards, and monitor long-term post-fire ecological recovery.
+Automated Google Earth Engine (GEE) machine learning pipeline designed to delineate prescribed burn perimeters, quantify burn severity (dNBR), evaluate management effectiveness, and track multi-year vegetation recovery across complex Wisconsin ecosystems. 
 
 Developed by **Arik Waldinger** (M.S. Environmental Observation & Informatics, UW–Madison).
 
 ---
 
-## Technical Architecture & Feature Stack
+## Key Technical Highlights
 
-The pipeline constructs a 33-band spectral and topographic feature stack per pixel across four core operational phases:
-
-1. **Pre-Fire Risk & Fuel Assessment:** Analyzes canopy fuel moisture and live fuel density using Normalized Difference Water Index (NDWI), Enhanced Vegetation Index (EVI), and Sentinel-1 C-Band SAR backscatter for structural roughness.
-2. **Post-Fire Char & Severity Mapping:** Applies a custom **Minimum NBR Reducer** across multi-week post-fire image collections to capture peak combustion char signatures prior to vegetation green-up. Calculates delta NBR (dNBR) and categorizes USGS burn severity tiers.
-3. **Soil Burn Severity & Erosion Risk Model:** Combines dNBR char metrics with USGS 10m DEM slope, flow accumulation, and Revised Universal Soil Loss Equation (RUSLE) soil erodibility ($K$-factor) data to isolate high-risk hydrological runoff zones.
-4. **Multi-Year Ecological Recovery Tracking:** Computes normalized recovery trajectories ($\% \text{NDVI}$ recovery) to evaluate vegetation re-establishment and invasive species encroachment over 1- to 3-year post-fire windows.
+* **100% Field-Verified Ground Truth:** Trained on **128 hand-digitized training polygons** delineated from first-hand, ground-based participation in active prescribed burn operations across Wisconsin.
+* **Adaptive Phenology & Dynamic Temporal Windows:** Resolves variable spring green-up rates across woodland, grassland, barrens, and wetland communities by pairing custom pre/post date ranges. Employs a **year-over-year leaf-on baseline (2024 vs. 2025)** for late-season woodland fires where May canopy leaf-out hides post-burn ground scars.
+* **33-Band Feature Stack:** Fuses raw Sentinel-2 MSI spectral bands, specialized burn indices (NBR, NBR2, MIRBI, BAIS2, BAI, BSI, CSI, SWIR ratio), vegetation condition metrics (NDVI, EVI, NDRE), and multi-temporal change deltas ($\Delta \text{NBR}, \Delta \text{NDVI}, \Delta \text{BAIS2}, \Delta \text{MIRBI}$, etc.).
+* **Adaptive Minimum NBR Reducer:** Extracts post-fire ash/char signatures across multi-week post-burn image collections before canopy leaf-out or vegetation green-up obscures the signal.
+* **Fire Effectiveness Index (FEI):** Translates raw severity values into an operational management scorecard:
+  $$\text{FEI} = \begin{cases} +1 & \text{Target Burn Severity (Low / Moderate)} \\ 0 & \text{Unburned / Mosaic} \\ -1 & \text{Overburn / Excessive High Severity} \end{cases}$$
+* **Long-Term Vegetation Recovery Tracking:** Computes peak summer (July–August) multi-year NDVI trajectories (2022–2025) and percentage vigor change tables per unit.
 
 ---
 
-## Pipeline & Script Architecture
+## 33-Band Feature Stack Architecture
 
-| Script | Phase | Description / Core Algorithms | Key Output |
+The Random Forest model evaluates 33 engineered spatial features per pixel across three seasonal composites:
+
+| Feature Category | Band / Index Names | Ecological Significance |
+| :--- | :--- | :--- |
+| **Post-Fire Spectral Core** | `NBR`, `NBR2`, `NDVI`, `EVI`, `BAI`, `BSI`, `MNDWI`, `CRI` | Baseline post-burn spectral response and ash reflectance. |
+| **Pre-Fire Baselines** | `preNBR`, `preNDVI`, `preBSI`, `preBAI`, `preNDRE`, `preCSI` | Pre-burn vegetation vigor and bare soil context. |
+| **Delta ($\Delta$) Indices** | `dNBR`, `dBSI`, `dBAI`, `dNDVI`, `dNDRE`, `dMIRBI`, `dBAIS2` | Absolute spectral change between pre- and post-fire states. |
+| **Specialized Ash/Char** | `BAIS2`, `MIRBI`, `NDRE`, `CSI`, `SWIR_ratio`, `NBR_NDVI` | High-sensitivity shortwave-infrared (SWIR) and red-edge indices for char detection. |
+| **Mid-Season Phenology** | `midNBR`, `midNDVI`, `midBSI`, `midBAI`, `midBAIS2`, `midNDRE` | Green-up velocity context across April–May transitions. |
+
+---
+
+## Monitored Prescribed Burn Units (16 Units)
+
+The tool processes 16 active management units across diverse Wisconsin ecoregions:
+
+| Unit Name | Target Burn Date | Primary Ecological Cover Type | Baseline Phenology Strategy |
 | :--- | :--- | :--- | :--- |
-| [`01_spectral_stack_builder.js`](scripts/01_spectral_stack_builder.js) | Data Prep | Synthesizes Sentinel-2, Sentinel-1 SAR, Landsat LST, and USGS 10m DEM into a aligned 33-band raster stack. | 33-Band Stack |
-| [`02_prefire_fuel_moisture_indices.js`](scripts/02_prefire_fuel_moisture_indices.js) | Pre-Fire | Calculates NDWI, Moisture Stress Index (MSI), and SAR canopy density prior to ignition. | Pre-Fire Fuel Risk Map |
-| [`03_minimum_nbr_char_reducer.js`](scripts/03_minimum_nbr_char_reducer.js) | Fire Event | Custom temporal reducer isolating absolute minimum NBR (darkest char/ash signature) post-burn. | Peak Char Signature |
-| [`04_burn_severity_dnbr_classified.js`](scripts/04_burn_severity_dnbr_classified.js) | Severity | Computes dNBR ($\text{NBR}_{\text{pre}} - \text{NBR}_{\text{post}}$) and classifies into USGS unburned, low, moderate, and high severity zones. | Classified Burn Severity Map |
-| [`05_soil_burn_severity_erosion_risk.js`](scripts/05_soil_burn_severity_erosion_risk.js) | Soil Hazard | Integrates dNBR with DEM slope, TPI, and CTI to highlight post-fire erosion and debris flow corridors. | Hydrological Soil Risk Map |
-| [`06_postfire_recovery_monitoring.js`](scripts/06_postfire_recovery_monitoring.js) | Recovery | Tracks multi-year NDVI trajectory against pre-fire baselines to verify native plant recruitment. | Recovery Rate Surface |
+| **Avoca** | 2025-03-10 | Wetland / Woodland | Standard 2025 Early Baseline |
+| **Cruson Slough** | 2025-03-13 | Wetland / Woodland | Standard 2025 Early Baseline |
+| **Arena** | 2025-03-18 | Woodland / Wetland | Standard 2025 Early Baseline |
+| **Westport** | 2025-03-25 | Grassland / Savanna | Standard 2025 Early Baseline |
+| **Mazomanie** | 2025-03-27 | Barrens / Savanna | Standard 2025 Early Baseline |
+| **Marbleseed** | 2025-04-01 | Grassland | Standard 2025 Early Baseline |
+| **Blue River** | 2025-04-04 | Barrens | Standard 2025 Early Baseline |
+| **Devil's Lake** | 2025-04-08 | Woodland | Year-Over-Year (May 2024 vs May 2025) |
+| **Dells WI** | 2025-04-12 | Woodland | Year-Over-Year (May 2024 vs May 2025) |
+| **Hardscrabble** | 2025-04-16 | Woodland / Savanna | Year-Over-Year (Apr/May 2024 vs 2025) |
+| **Yellowstone** | 2025-04-25 | Woodland / Grassland / Savanna | Year-Over-Year (May 2024 vs May 2025) |
+| **Yorks** | 2025-04-26 | Grassland | Standard 2025 Early Baseline |
+| **Bakkens** | 2025-04-27 | Savanna / Grassland | Standard 2025 Early Baseline |
+| **Belmont** | 2025-04-30 | Grassland | Standard 2025 Early Baseline |
+| **Lower Narrows** | 2025-05-01 | Woodland | Year-Over-Year (May 2024 vs May 2025) |
+| **Natural Bridge** | 2025-05-09 | Woodland / Grassland | Year-Over-Year (May 2024 vs May 2025) |
 
 ---
 
-## Key Performance Indicators & Results
+## Machine Learning & Evaluation Methodology
 
-* **Coverage Extent:** 2,700 acres across heterogeneous Driftless Area topography.
-* **Spatial Resolution:** 10-meter native spatial grid.
-* **Spectral Sensitivity:** Peak char retention captured via SWIR (B12) and NIR (B8) spectral difference.
-* **Erosion Risk Calibration:** Successfully identified steep coulee drainages (>25% slope) prone to post-burn soil loss.
-
----
-
-## Institutional & Data Disclaimer
-
-*This project was developed for academic and ecological modeling research purposes. Spatial datasets and analytical outputs do not constitute official emergency response protocols or regulatory management decisions. Data processing relies on public Copernicus Sentinel-2/Sentinel-1 and USGS satellite streams hosted within Google Earth Engine.*
+1. **Random Forest Classifier:** Trained using `ee.Classifier.smileRandomForest` (200 trees, 4 variables per split, seed 42).
+2. **Train/Test Validation Split:** 80% of ground-truth sample points allocated to training, 20% holdout set reserved for unbiased evaluation.
+3. **Validation Metrics:**
+   * **Overall Accuracy & Kappa ($\kappa$) Statistic**
+   * **Jaccard Index (Intersection over Union)** specifically calculated for the Burned class:
+     $$\text{Jaccard} = \frac{\text{True Positives}}{\text{True Positives} + \text{False Positives} + \text{False Negatives}}$$
+   * **Ranked Variable Importance:** Evaluates feature contribution across all 33 bands to identify dominant spectral discriminators.
 
 ---
 
 ## How to Run in Google Earth Engine
 
-1. Open any script from the [`scripts/`](scripts/) folder in this repository.
-2. Copy and paste the JavaScript code into your [Google Earth Engine Code Editor](https://code.earthengine.google.com/).
-3. Define or upload your study area boundary (`ee.Geometry.Polygon` or `ee.FeatureCollection`).
-4. Set the pre-burn and post-burn date parameters at the top of the script.
+1. Open the master script file: [`scripts/wi_prescribed_fire_tool.js`](scripts/wi_prescribed_fire_tool.js).
+2. Copy the entire JavaScript code block.
+3. Paste into your [Google Earth Engine Code Editor](https://code.earthengine.google.com/).
+4. Ensure access to the training asset (`projects/code-test-476615/assets/Burn_TrainingData`) or swap in your own `ee.FeatureCollection` with a `class_id` property.
 5. Click **Run**.
+6. Inspect the Console tab for accuracy benchmarks, the 33-band feature glossary, per-unit acreage summaries, and the multi-year NDVI recovery chart.
+
+---
+
+## Acknowledgments & Disclaimers
+
+* **Field Operations & Research:** Delineated and analyzed by Arik Waldinger through direct operational involvement in Wisconsin prescribed burns.
+* **AI Code Optimization:** Assistance provided by Claude (Anthropic AI) for debugging, structural optimization, and array handling. All ecological logic, temporal parameterization, field data collection, and model design decisions were directed by the primary author.
+* **Data Sources:** Uses public Copernicus Sentinel-2 Harmonized Surface Reflectance (`COPERNICUS/S2_SR_HARMONIZED`) imagery hosted on Google Earth Engine.
